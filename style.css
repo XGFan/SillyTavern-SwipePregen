@@ -63,7 +63,79 @@ body.hideAllSwipeButtons     .sp_bg_gen_btn.sp_btn_spinning {
     to   { transform: rotate(360deg); }
 }
 
-/* ── Freeze (no overlay element; MutationObserver keeps .mes_text intact) ── */
+/* ── 遮挡层 (mask) ────────────────────────────────────────────────────────── */
+
+/*
+ * The real message SillyTavern writes into, while the clone stands in for it.
+ *
+ * Deliberately not `display: none`. SillyTavern animates this element's height
+ * while it is hidden, and jQuery records whatever display the element had at
+ * the start of an animation and writes it back inline when the animation ends -
+ * after the 遮挡层 is already gone, leaving the message invisible for good.
+ * Taking it out of the flow instead keeps jQuery's bookkeeping honest.
+ */
+.mes.sp_mask_hidden {
+    position: absolute !important;
+    width: 100% !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    z-index: -1 !important;
+}
+
+/*
+ * SillyTavern hides every chevron while it generates. The 遮挡层 exists precisely
+ * so the reader can keep moving between finished 备选回复 during a run, so the
+ * clone's own chevrons are put back. Higher specificity than SillyTavern's rule,
+ * and this stylesheet loads after it.
+ */
+.mes.sp_mask .swipe_left,
+.mes.sp_mask .swipe_right {
+    display: flex !important;
+    visibility: visible !important;
+    /* SillyTavern's hiding rule is itself !important, so matching it is the
+       only way to put the chevrons back; without this they stay clickable but
+       invisible for the whole run. */
+    opacity: 0.3 !important;
+    pointer-events: auto !important;
+    /* The same rule also marks them inert, which takes them out of hit-testing
+       entirely: the chevron is visible, the cursor is a pointer, and the click
+       lands on whatever is behind it. */
+    interactivity: auto !important;
+}
+
+.mes.sp_mask .swipe_left:hover,
+.mes.sp_mask .swipe_right:hover {
+    opacity: 1 !important;
+}
+
+/* Nothing to go back to / forward to. */
+.mes.sp_mask.sp_mask_at_start .swipe_left,
+.mes.sp_mask.sp_mask_at_end   .swipe_right {
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+
+/* Same reasoning as the chevrons: the counter is the reader's position indicator. */
+.mes.sp_mask .swipes-counter {
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+/*
+ * A 排队 owns the screen for its whole run. SillyTavern only hides the send
+ * button while it is generating, which leaves it live during the pauses between
+ * generations - a send there appends messages behind the 遮挡层 clone and leaves
+ * a stale duplicate sitting mid-chat until the run ends.
+ */
+body:has(#chat .sp_mask) #send_but {
+    display: none !important;
+}
+
+/* The viewed 备选回复 carries no thinking of its own. */
+.mes.sp_mask .mes_reasoning_details.sp_mask_empty {
+    display: none !important;
+}
+
 
 /* ── Progress bar ────────────────────────────────────────────────────────── */
 

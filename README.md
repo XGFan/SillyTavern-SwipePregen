@@ -54,6 +54,8 @@ All modes use SillyTavern's normal generation pipeline, so your API settings, sa
 
 The button is only shown on the last message when it belongs to the AI. While any generation is in progress the icon spins; clicking it again will show a warning instead of starting a second generation.
 
+While pre-generation is running you can still swipe between the replies that are already finished — with the chevrons or the arrow keys, as usual. The counter shows where you are out of how many are ready, and climbs as more arrive. Wherever you stop is where the view stays once the run ends. The reply still being written is not reachable until it is done.
+
 Aborting a reply with SillyTavern's stop button also drops whatever was queued behind it.
 
 ## Translations

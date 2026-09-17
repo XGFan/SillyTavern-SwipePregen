@@ -2,9 +2,9 @@
  * Swipe Pregeneration Extension for SillyTavern
  *
  * Feature 1: "Generate in Background" button next to the swipe-right chevron.
- *   Clicking it starts a swipe generation while keeping the current message readable
- *   via a visual overlay. When generation completes, the view automatically snaps
- *   back to the original swipe so the user can swipe right at their own pace.
+ *   Clicking it starts a swipe generation while the reader keeps seeing the 备选回复
+ *   they chose, behind a 遮挡层. They can still move between finished 备选回复 while
+ *   it runs, and the view stays wherever they left it.
  *
  * Feature 2: "Swipe pre-generation" entry in the Extensions wand menu.
  *   Opens a modal to batch-pre-generate N swipes with an optional progress bar.
@@ -40,6 +40,16 @@ const SEND_BTN_ID   = `${MODULE_NAME}_send_queue_btn`;
 const SETTINGS_ID   = `${MODULE_NAME}_settings`;
 const BTN_CLASS     = 'sp_bg_gen_btn';
 
+/**
+ * The real messages, never the 遮挡层 clone standing in front of one. Callers take
+ * `.last()` to get the last real message.
+ *
+ * Keyed on `mesid` rather than on `last_mes`: while a 遮挡层 is up the clone is
+ * the last .mes in the chat, so SillyTavern hands it the `last_mes` class and a
+ * lookup by that class would find nothing real to work with.
+ */
+const REAL_LAST_MES = '#chat .mes[mesid]';
+
 /** How long to wait for a send to actually raise SillyTavern's generating flag. */
 const GEN_START_TIMEOUT_MS = 10 * 1000;
 /** Upper bound on how long to wait for the reply itself to finish. */
@@ -70,14 +80,13 @@ let queueWaiting = false;
 /** Set when the user aborts or switches chat while a queue run is waiting. */
 let queueCancelled = false;
 
-/** Direct reference to the frozen real .mes element, for height-lock cleanup. */
-let $frozenMes = null;
-
-/** Original inline styles we temporarily override during the freeze. */
-let frozenStyles = null;
-
-/** MutationObserver that keeps .mes_text showing the frozen HTML during streaming. */
-let _frozenObserver = null;
+/**
+ * Live 遮挡层 state, or null when nothing is masked.
+ * @type {{ real: HTMLElement, clone: HTMLElement, message: object, mesId: number,
+ *          completedCount: number, viewedSwipeId: number,
+ *          handlers: { $el: JQuery, fn: Function }[] } | null}
+ */
+let mask = null;
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -131,6 +140,16 @@ function pollUntilReady(inject, attempts = 20, intervalMs = 250) {
     setTimeout(() => pollUntilReady(inject, attempts - 1, intervalMs), intervalMs);
 }
 
+/**
+ * True while a 排队 owns the screen, including the pauses between its
+ * generations. `isBackgroundGenerating` only covers one generation, so on its
+ * own it leaves the whole `requestDelayMs` gap open for a second run to start,
+ * tear down the live 遮挡层 and expose the reply being written.
+ */
+function isRunActive() {
+    return !!mask || isBackgroundGenerating;
+}
+
 /** Returns true when it is safe to start a background generation. */
 function canStart() {
     if (isBackgroundGenerating) return false;
@@ -144,72 +163,188 @@ function canStart() {
 }
 
 /**
- * Freeze the last message by (a) locking the .mes container height so it can't
- * grow or shrink, and (b) using a MutationObserver to instantly restore the
- * original rendered HTML whenever SillyTavern's streaming overwrites .mes_text.
+ * Hide the message SillyTavern is about to write into, and show a copy of it in
+ * its place, so the reader goes on seeing the 备选回复 they chose.
  *
- * This keeps the real element in place in the normal document flow so the user
- * can scroll freely and reads the original message throughout generation.
+ * The copy is a clone of the whole .mes with its `mesid` attribute stripped.
+ * Every SillyTavern lookup that touches a message keys on `mesid` - streaming
+ * (`#chat .mes[mesid="N"]`), addOneMessage, refreshSwipeButtons - so the clone
+ * is invisible to all of them while inheriting the theme's styling for free.
  *
- * @param {jQuery} $lastMes  - The .mes element (last_mes)
+ * Nothing is reverted after the fact, which is the point: there is no frame in
+ * which the incoming text can reach the screen.
+ *
+ * @param {{ mesId: number, message: object, completedCount: number, viewedSwipeId: number }} opts
  */
-function createFreezeOverlay($lastMes) {
-    const $mesText = $lastMes.find('.mes_text').first();
-    if (!$mesText.length) return;
+function applyMask({ mesId, message, completedCount, viewedSwipeId }) {
+    removeMask();
+    // Heal anything a previous run left behind before taking a fresh snapshot.
+    document.querySelectorAll('#chat .sp_mask').forEach(el => el.remove());
+    document.querySelectorAll('.sp_mask_hidden').forEach(el => el.classList.remove('sp_mask_hidden'));
+    restoreLastMes();
 
-    const mesTextEl  = $mesText[0];
-    const frozenHtml = mesTextEl.innerHTML;  // snapshot of fully-rendered content
+    const real = document.querySelector(`#chat .mes[mesid="${mesId}"]`);
+    if (!real) return false;
 
-    // Lock the message container at its current height so neither the streaming
-    // placeholder "..." nor an eventually longer generated message resizes it.
-    frozenStyles = {
-        mesHeight    : $lastMes[0].style.height,
-        mesMinHeight : $lastMes[0].style.minHeight,
-        mesOverflow  : $lastMes[0].style.overflow,
-    };
-    $lastMes.css({
-        height    : $lastMes.outerHeight(),
-        minHeight : $lastMes.outerHeight(),
-        overflow  : 'hidden',
-    });
+    const clone = /** @type {HTMLElement} */ (real.cloneNode(true));
+    // `mesid` is the only thing stripped: every SillyTavern lookup that writes to
+    // a message keys on it. `last_mes` is deliberately kept, because the theme
+    // hides the chevrons and the counter on anything that is not the last message.
+    clone.removeAttribute('mesid');
+    clone.classList.add('sp_mask');
 
-    // Watch .mes_text for any change and immediately restore the frozen HTML.
-    // Disconnect → mutate → reconnect prevents infinite recursion.
-    // requestAnimationFrame batches rapid streaming updates to ≤1 restore/frame.
-    let rafPending = false;
-    _frozenObserver = new MutationObserver(() => {
-        if (rafPending || !_frozenObserver) return;
-        rafPending = true;
-        requestAnimationFrame(() => {
-            if (!_frozenObserver) { rafPending = false; return; }
-            _frozenObserver.disconnect();
-            mesTextEl.innerHTML = frozenHtml;
-            _frozenObserver.observe(mesTextEl, { childList: true, subtree: true, characterData: true });
-            rafPending = false;
-        });
-    });
-    _frozenObserver.observe(mesTextEl, { childList: true, subtree: true, characterData: true });
+    // The clone is the only copy that should answer to `last_mes` while masked.
+    // SillyTavern's Escape handler targets '.last_mes .swipe_left' with no
+    // :last, so leaving the class on the real element lets that gesture reach
+    // SillyTavern's own handler and swipe the real message underneath us.
+    real.classList.remove('last_mes');
+    real.classList.add('sp_mask_hidden');
+    real.after(clone);
 
-    $frozenMes = $lastMes;
+    mask = { real, clone, message, mesId, completedCount, viewedSwipeId, handlers: [] };
+
+    // Bound through jQuery, not addEventListener. SillyTavern's own chevron
+    // handler is delegated on `document`, and its keyboard shortcut, touch
+    // gestures and Escape handler all reach it with `.trigger('click')`. jQuery
+    // dispatches a triggered event through its own handler list - target first,
+    // then ancestors - and only falls back to the native click at the very end.
+    // A native listener therefore runs *after* the delegate and cannot stop it;
+    // a jQuery handler on the element runs before it and can.
+    for (const [selector, step] of [['.swipe_left', -1], ['.swipe_right', 1]]) {
+        const $el = $(clone).find(selector);
+        if (!$el.length) continue;
+        const fn = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            navigateMask(step);
+        };
+        $el.on('click', fn);
+        mask.handlers.push({ $el, fn });
+    }
+
+    renderMask();
+    return true;
 }
 
-/** Stop the freeze observer and restore all temporarily-overridden styles. */
-function removeOverlay() {
-    if (_frozenObserver) {
-        _frozenObserver.disconnect();
-        _frozenObserver = null;
+/**
+ * Hand `last_mes` back to the real last message.
+ *
+ * SillyTavern gives the class to whichever `.mes` comes last, which is the
+ * 遮挡层 clone for as long as one is up, so it leaves with the clone.
+ */
+function restoreLastMes() {
+    const messages = document.querySelectorAll(REAL_LAST_MES);
+    messages.forEach(m => m.classList.remove('last_mes'));
+    messages[messages.length - 1]?.classList.add('last_mes');
+}
+
+/** Fill the 遮挡层 with the 备选回复 the reader is currently on. */
+function renderMask() {
+    if (!mask) return;
+
+    const { clone, message, mesId, completedCount } = mask;
+    const ctx = getContext();
+
+    // Clamped here as well as in navigateMask: "4/3" was born of an out-of-range
+    // swipe_id reaching a formatter, so the formatter itself refuses to print one.
+    const id = Math.min(Math.max(mask.viewedSwipeId, 0), Math.max(0, completedCount - 1));
+    const info = message.swipe_info?.[id] ?? {};
+
+    // Only message 0 is passed as -1. SillyTavern's formatter writes macro
+    // substitutions back into chat[0].mes when handed message 0, which would
+    // bake them into a stored greeting on every navigation step. Passing -1 for
+    // every message would be worse: it leaves the regex engine's `depth`
+    // undefined, and undefined does not mean depth 0 - it disables depth
+    // filtering entirely, so depth-scoped user scripts would apply inside the
+    // 遮挡层 and nowhere else, and the text would change as the mask came down.
+    const fmtId = mesId === 0 ? -1 : mesId;
+
+    // The -1 path also skips the macro substitution message 0 would normally
+    // get, so an alternate greeting would show literal {{user}} / {{char}}.
+    const raw = message.swipes?.[id] ?? message.mes ?? '';
+    const body = mesId === 0 ? ctx.substituteParams(raw, undefined, message.name) : raw;
+
+    const text = clone.querySelector('.mes_text');
+    if (text) {
+        text.innerHTML = ctx.messageFormatting(
+            body, message.name, message.is_system, message.is_user, fmtId,
+        );
     }
 
-    if ($frozenMes && frozenStyles) {
-        $frozenMes.css({
-            height    : frozenStyles.mesHeight,
-            minHeight : frozenStyles.mesMinHeight,
-            overflow  : frozenStyles.mesOverflow,
-        });
+    // Without this the reader would see the old text paired with the incoming
+    // reply's thinking, which reads as if the model contradicted itself.
+    const details = clone.querySelector('.mes_reasoning_details');
+    if (details) {
+        const reasoning = info.extra?.reasoning ?? '';
+        const reasoningBody = details.querySelector('.mes_reasoning');
+        if (reasoning && reasoningBody) {
+            reasoningBody.innerHTML = ctx.messageFormatting(
+                reasoning, message.name, message.is_system, message.is_user, fmtId, {}, true,
+            );
+        }
+        details.classList.toggle('sp_mask_empty', !reasoning);
     }
 
-    $frozenMes   = null;
-    frozenStyles = null;
+    // SillyTavern's own timer formatter is not exported; this is its value half.
+    const timer = clone.querySelector('.mes_timer');
+    if (timer) {
+        const started = new Date(info.gen_started).getTime();
+        const finished = new Date(info.gen_finished).getTime();
+        const ok = !isNaN(started) && !isNaN(finished) && finished >= started;
+        timer.textContent = ok ? `${((finished - started) / 1000).toFixed(1)}s` : '';
+        timer.removeAttribute('title');
+    }
+
+    const tokens = clone.querySelector('.tokenCounterDisplay');
+    if (tokens) {
+        const count = info.extra?.token_count;
+        tokens.textContent = count ? `${count}t` : '';
+    }
+
+    // The slot being written is not a 备选回复, so it is neither counted nor reachable.
+    const counter = clone.querySelector('.swipes-counter');
+    if (counter) {
+        // SillyTavern marks the counter hidden for the duration of a generation;
+        // inside the 遮挡层 it is the reader's only position indicator.
+        counter.removeAttribute('hidden');
+        counter.textContent = `${id + 1}\u200b/\u200b${completedCount}`;
+    }
+
+    // The clone is a snapshot, so it never gains the classes SillyTavern adds to
+    // the real message as the 排队 banks more 备选回复. `swipes_visible` is the one
+    // that matters: without it the theme treats this message as having nothing to
+    // swipe between and hides the chevrons and the counter.
+    clone.classList.toggle('swipes_visible', completedCount > 1);
+
+    clone.classList.toggle('sp_mask_at_start', id <= 0);
+    clone.classList.toggle('sp_mask_at_end', id >= completedCount - 1);
+}
+
+/** Move the reader between finished 备选回复 while a generation is running. */
+function navigateMask(step) {
+    if (!mask) return;
+
+    const next = mask.viewedSwipeId + step;
+    if (next < 0 || next > mask.completedCount - 1) return;
+
+    mask.viewedSwipeId = next;
+    renderMask();
+}
+
+/** Drop the 遮挡层 and let the real message show again. */
+function removeMask() {
+    if (!mask) return;
+
+    for (const { $el, fn } of mask.handlers) {
+        $el.off('click', fn);
+    }
+
+    mask.clone.remove();
+    mask.real.classList.remove('sp_mask_hidden');
+
+    restoreLastMes();
+    mask = null;
 }
 
 /**
@@ -234,16 +369,18 @@ function captureState(msg, id) {
  * Restore a chat message to a previously captured state.
  * Reads back from swipe_info if available (which has the canonical timestamps).
  *
- * @param {object} msg   - live chat message object (mutated in place)
- * @param {object} state - previously returned by captureState()
+ * @param {object} msg     - live chat message object (mutated in place)
+ * @param {object} state   - previously returned by captureState()
+ * @param {number} swipeId - the 备选回复 to land on; differs from the captured one
+ *                           when the reader navigated while the 遮挡层 was up.
  */
-function restoreState(msg, state) {
-    msg.swipe_id = state.swipeId;
+function restoreState(msg, state, swipeId = state.swipeId) {
+    msg.swipe_id = swipeId;
 
     // Prefer the data from swipe_info as it may have been updated during gen
-    const liveInfo = msg.swipe_info?.[state.swipeId];
+    const liveInfo = msg.swipe_info?.[swipeId];
     if (liveInfo) {
-        msg.mes          = msg.swipes[state.swipeId] ?? state.mes;
+        msg.mes          = msg.swipes[swipeId] ?? state.mes;
         msg.send_date    = liveInfo.send_date    ?? state.send_date;
         msg.gen_started  = liveInfo.gen_started  ?? state.gen_started;
         msg.gen_finished = liveInfo.gen_finished ?? state.gen_finished;
@@ -257,11 +394,23 @@ function restoreState(msg, state) {
     }
 }
 
+/**
+ * Re-render a message after its viewed 备选回复 changed.
+ *
+ * `refreshBgGenButton` has to come last: SillyTavern's re-render rebuilds the
+ * swipe area, taking this extension's button with it.
+ */
+function rerenderMessage(msg, mesId) {
+    addOneMessage(msg, { type: 'swipe', forceId: mesId, showSwipes: true });
+    refreshSwipeButtons(true);
+    refreshBgGenButton();
+}
+
 // ─── Core: single background generation ──────────────────────────────────────
 
 /**
  * Trigger a single swipe generation in the background.
- * The current swipe remains readable via a freeze overlay.
+ * The 备选回复 the reader is on stays on screen behind a 遮挡层.
  *
  * Awaits the entire swipe() call (including its internal endSwipe cleanup) so
  * we restore the view AFTER SillyTavern has finished all its house-keeping.
@@ -294,20 +443,37 @@ async function runBackgroundGeneration({ silent = false } = {}) {
 
     // Snapshot the state we want to restore after generation finishes.
     const capturedState    = captureState(lastMsg, origSwipe);
+    const chatId           = getContext()?.chatId;
     isBackgroundGenerating = true;
 
-    // Build the freeze overlay before triggering generation so the user can
-    // keep reading the current message while the new one streams underneath.
-    const $lastMes  = $('#chat .last_mes');
-    createFreezeOverlay($lastMes);
-
-    // Keep the original button visible as the activity indicator.
+    // Spin first, mask second: the 遮挡层 is a clone, so it has to be taken after
+    // the spinner class is on or the visible copy would show an idle button.
+    const $lastMes = $(REAL_LAST_MES).last();
     $lastMes.find(`.${BTN_CLASS}`).addClass('sp_btn_spinning');
+
+    // A 排队 holds one 遮挡层 across all of its generations, so that the reader's
+    // view never blinks between them. Only put one up if nobody else owns it.
+    // Ownership is the mask object itself, not a boolean. Between this run's
+    // teardown and its `finally`, `mask` can be repopulated by another run - the
+    // await on saveChatConditional below is long enough for a second click to
+    // land - and a boolean would make this run tear down that run's live 遮挡层.
+    const ownsMask = !mask;
+    if (ownsMask) {
+        applyMask({
+            mesId          : lastIdx,
+            message        : lastMsg,
+            completedCount : origCount,
+            viewedSwipeId  : origSwipe,
+        });
+    }
+    const ownedMask = ownsMask ? mask : null;
+    /** Take down only the 遮挡层 this call put up, and only if it is still ours. */
+    const releaseMask = () => { if (ownedMask && mask === ownedMask) removeMask(); };
 
     try {
         // Await the full swipe including SillyTavern's endSwipe() cleanup.
-        // The new content streams into the hidden .mes_text; the MutationObserver
-        // instantly restores the frozen HTML so the user reads the original message.
+        // The new content streams into the real message, which the 遮挡层 has
+        // hidden; the reader is looking at the clone the whole time.
         // forceDuration:0 suppresses the slide-out / slide-in animation entirely.
         await ctx.swipe.to(null, SWIPE_DIRECTION.RIGHT, {
             source       : SWIPE_SOURCE.AUTO_SWIPE,
@@ -321,28 +487,61 @@ async function runBackgroundGeneration({ silent = false } = {}) {
         isBackgroundGenerating = false;
     }
 
-    // Check whether a new swipe slot was actually created.
-    const updatedMsg = ctx.chat[lastIdx];
-    const newCount   = updatedMsg?.swipes?.length ?? 0;
+    // Everything below is wrapped so that a throw can never leave the real
+    // message hidden behind a 遮挡层 that nothing will take down again.
+    try {
+        // The reader may have walked away while this was generating; everything
+        // below writes to chat state, which would land in the wrong conversation.
+        if (getContext()?.chatId !== chatId) return false;
 
-    if (newCount > origCount) {
-        // A new swipe was added.  Snap the view back to what the user was
-        // reading (new swipe is accessible by swiping right).
-        restoreState(updatedMsg, capturedState);
-        // Stop the observer before re-rendering so addOneMessage can freely
-        // update .mes_text with the original swipe content.
-        removeOverlay();
-        addOneMessage(updatedMsg, { type: 'swipe', forceId: lastIdx, showSwipes: true });
+        // When a forced swipe is reverted, SillyTavern's endSwipe calls
+        // redisplayChat, which removes the real message *and* the 遮挡层 clone
+        // standing next to it. Re-anchor onto the freshly rendered element.
+        if (mask && !mask.real.isConnected) {
+            const { viewedSwipeId: viewed, completedCount: completed } = mask;
+            removeMask();
+            const reanchored = applyMask({ mesId: lastIdx, message: ctx.chat[lastIdx], completedCount: completed, viewedSwipeId: viewed });
+            // Carrying on without a 遮挡层 would let the rest of the 排队 stream into
+            // the message the reader is looking at, so stop the run instead.
+            if (!reanchored) batchAbort = true;
+        }
+
+        // Check whether a new swipe slot was actually created.
+        const updatedMsg = ctx.chat[lastIdx];
+        const newCount   = updatedMsg?.swipes?.length ?? 0;
+
+        // Read where the reader actually is before the 遮挡层 goes away - they may
+        // have moved to another 备选回复 while this was running.
+        const viewedSwipeId = mask?.viewedSwipeId ?? origSwipe;
+
+        if (newCount > origCount) {
+            // A new swipe was added.  Land on whatever the reader is looking at now,
+            // not on wherever they were when this run started.
+            restoreState(updatedMsg, capturedState, viewedSwipeId);
+
+            if (ownedMask) {
+                releaseMask();
+            } else if (mask) {
+                // One more 备选回复 is finished, so it becomes reachable and counted.
+                mask.message        = updatedMsg;
+                mask.completedCount = newCount;
+                renderMask();
+            }
+
+            rerenderMessage(updatedMsg, lastIdx);
+            await saveChatConditional();
+            if (!silent) toastr.success(t`Swipe ready! (${newCount} total)`, '', { timeOut: 2500 });
+            return true;
+        }
+
+        // Nothing changed (generation cancelled / overswipe NONE / etc.) – clean up.
+        releaseMask();
         refreshSwipeButtons(true);
-        await saveChatConditional();
-        if (!silent) toastr.success(t`Swipe ready! (${newCount} total)`, '', { timeOut: 2500 });
-        return true;
+        refreshBgGenButton();
+        return false;
+    } finally {
+        releaseMask();
     }
-
-    // Nothing changed (generation cancelled / overswipe NONE / etc.) – clean up.
-    removeOverlay();
-    refreshSwipeButtons(true);
-    return false;
 }
 
 // ─── Core: batch pre-generation ──────────────────────────────────────────────
@@ -354,33 +553,65 @@ async function runBackgroundGeneration({ silent = false } = {}) {
  * @param {number} count  - Number of swipes to generate.
  */
 async function runBatch(count) {
-    if (!canStart()) {
+    if (isRunActive() || !canStart()) {
         toastr.warning(t`Cannot start pre-generation – generation already in progress.`);
         return;
     }
 
     batchAbort = false;
     const settings = getSettings();
+    const ctx      = getContext();
+    const mesId    = ctx.chat.length - 1;
+    const message  = ctx.chat[mesId];
+    const chatId   = ctx.chatId;
 
     if (settings.showProgressBar) showProgressBar(0, count);
 
+    // One 遮挡层 for the whole 排队. Putting it up and taking it down around every
+    // single generation would blink the reader's view on each pause, and would
+    // tear the chevrons out from under them mid-click.
+    applyMask({
+        mesId,
+        message,
+        completedCount : message.swipes?.length ?? 1,
+        viewedSwipeId  : message.swipe_id ?? 0,
+    });
+
     let completed = 0;
-    for (let i = 0; i < count; i++) {
-        if (batchAbort) break;
+    try {
+        for (let i = 0; i < count; i++) {
+            if (batchAbort) break;
 
-        const ok = await runBackgroundGeneration({ silent: true });
-        if (!ok) break;
+            const ok = await runBackgroundGeneration({ silent: true });
+            if (!ok) break;
 
-        completed++;
-        if (settings.showProgressBar) showProgressBar(completed, count);
+            completed++;
+            if (settings.showProgressBar) showProgressBar(completed, count);
 
-        // Brief pause to avoid hammering the API
-        if (i < count - 1 && !batchAbort) {
-            await sleep(settings.requestDelayMs);
+            // Brief pause to avoid hammering the API
+            if (i < count - 1 && !batchAbort) {
+                await sleep(settings.requestDelayMs);
+            }
         }
-    }
+    } finally {
+        const viewed = mask?.viewedSwipeId;
+        removeMask();
 
-    if (settings.showProgressBar) removeProgressBar();
+        // The reader may have moved during the last generation, after the run
+        // that would otherwise have committed their position.
+        // `ctx.chat` is SillyTavern's live array, refilled in place on a chat
+        // switch, so without this guard the commit below can land in whichever
+        // conversation the reader moved to.
+        const current = getContext()?.chatId === chatId ? ctx.chat[mesId] : null;
+        if (typeof viewed === 'number' && current && current.swipe_id !== viewed
+            && current.swipes?.[viewed] !== undefined) {
+            restoreState(current, captureState(current, viewed), viewed);
+            rerenderMessage(current, mesId);
+        }
+
+        refreshBgGenButton();
+        if (settings.showProgressBar) removeProgressBar();
+    }
 
     if (completed > 0) {
         toastr.success(t`Pre-generation complete! Generated ${completed} swipe(s).`);
@@ -428,7 +659,7 @@ async function queueAfterCurrentGeneration(extra) {
  * and let the GENERATION_STARTED handler pick it up.
  */
 async function sendAndQueue() {
-    if (isBackgroundGenerating || isGenerating()) {
+    if (isRunActive() || isGenerating()) {
         toastr.warning(t`A generation is already in progress.`);
         return;
     }
@@ -489,10 +720,17 @@ function removeProgressBar() {
  * last message.  Safe to call multiple times – guards against duplicates.
  */
 function refreshBgGenButton() {
-    // Remove from any non-last message (happens after a new message arrives)
-    $(`#chat .mes:not(.last_mes) .${BTN_CLASS}`).remove();
+    // Remove from any non-last message (happens after a new message arrives).
+    const $lastMes = $(REAL_LAST_MES).last();
 
-    const $lastMes = $('#chat .last_mes');
+    // Strip the button from every message except the real last one and the
+    // 遮挡层 clone. Keyed on identity rather than on `last_mes`, which belongs
+    // to the clone while a run is masked.
+    $(`#chat .mes .${BTN_CLASS}`).each(function () {
+        const keep = ($lastMes.length && $lastMes[0].contains(this)) || this.closest('.sp_mask');
+        if (!keep) this.remove();
+    });
+
     if (!$lastMes.length) return;
 
     // Only show on non-user, non-system messages
@@ -510,7 +748,7 @@ function refreshBgGenButton() {
 
     $btn.on('click', async (e) => {
         e.stopPropagation();
-        if (isBackgroundGenerating || isGenerating()) {
+        if (isRunActive() || isGenerating()) {
             toastr.warning(t`A generation is already in progress.`);
             return;
         }
@@ -748,7 +986,7 @@ async function openPregenModal() {
         batchAbort       = true;
         armedExtraSwipes = 0;
         queueCancelled   = true;
-        removeOverlay();
+        removeMask();
         removeProgressBar();
         isBackgroundGenerating = false;
     });
