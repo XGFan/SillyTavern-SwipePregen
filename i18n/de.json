@@ -11,5 +11,10 @@
     "Number of swipes to pre-generate:": "Anzahl der vorzugenerierenden Swipes:",
     "Show progress bar": "Fortschrittsbalken anzeigen",
     "Start": "Starten",
-    "Cancel": "Abbrechen"
+    "Cancel": "Abbrechen",
+    "Send and pre-generate extra swipes": "Senden und zus\u00e4tzliche Swipes vorgenerieren",
+    "Delay between requests (ms)": "Verz\u00f6gerung zwischen Anfragen (ms)",
+    "Replies per send": "Antworten pro Senden",
+    "The normal send button queues replies too": "Der normale Senden-Button reiht ebenfalls Antworten ein",
+    "The delay is applied between every two queued generations.": "Die Verz\u00f6gerung gilt zwischen je zwei eingereihten Generierungen."
 }

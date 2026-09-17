@@ -11,5 +11,10 @@
     "Number of swipes to pre-generate:": "Number of swipes to pre-generate:",
     "Show progress bar": "Show progress bar",
     "Start": "Start",
-    "Cancel": "Cancel"
+    "Cancel": "Cancel",
+    "Send and pre-generate extra swipes": "Send and pre-generate extra swipes",
+    "Delay between requests (ms)": "Delay between requests (ms)",
+    "Replies per send": "Replies per send",
+    "The normal send button queues replies too": "The normal send button queues replies too",
+    "The delay is applied between every two queued generations.": "The delay is applied between every two queued generations."
 }

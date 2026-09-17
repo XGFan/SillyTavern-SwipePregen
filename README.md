@@ -12,7 +12,18 @@ Generates the next AI reply in the background while you keep reading the current
 
 ![Batch pre-generation modal and progress bar](img/batch_preview.png)
 
-Both modes use SillyTavern's normal generation pipeline, so your API settings, samplers, and prompt templates apply as usual.
+**Send and queue** — a stack icon next to the send button. It sends your message exactly like the normal send button does, then keeps generating in the background until the configured number of replies is ready. You read the first reply while the rest arrive; swipe right when you want the next one. If you would rather have the normal send button do this, turn it on in the settings.
+
+**Settings** — Extensions panel → *Swipe Pre-generation*. Most importantly the delay between two requests, which applies to every queued generation (send-and-queue and the batch modal alike).
+
+| Setting | Default | What it does |
+|---|---|---|
+| Delay between requests (ms) | 300 | Pause inserted between two queued generations |
+| Replies per send | 3 | How many replies the send-and-queue button aims for (1 = a plain send) |
+| The normal send button queues replies too | off | Makes SillyTavern's own send button queue as well |
+| Show progress bar | on | Progress bar at the top of the chat during a queued run |
+
+All modes use SillyTavern's normal generation pipeline, so your API settings, samplers, and prompt templates apply as usual.
 
 ## Installation
 
@@ -37,9 +48,13 @@ Both modes use SillyTavern's normal generation pipeline, so your API settings, s
 |---|---|
 | Generate one swipe | Click >> next to the → chevron on the last message |
 | Generate multiple swipes | Wand menu → *Swipe pre-generation* |
+| Send and pre-generate several replies | Click the stack icon next to the send button |
+| Change the delay, or how many replies a send produces | Extensions panel → *Swipe Pre-generation* |
 | Stop a running batch | Click the stop button in the progress bar |
 
 The button is only shown on the last message when it belongs to the AI. While any generation is in progress the icon spins; clicking it again will show a warning instead of starting a second generation.
+
+Aborting a reply with SillyTavern's stop button also drops whatever was queued behind it.
 
 ## Translations
 

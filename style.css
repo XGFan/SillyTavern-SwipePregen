@@ -111,3 +111,38 @@ body.hideAllSwipeButtons     .sp_bg_gen_btn.sp_btn_spinning {
     user-select: none;
     cursor: pointer;
 }
+
+/* ── Send-and-queue button ───────────────────────────────────────────────── */
+
+#swipe_pregen_send_queue_btn {
+    /* Font size and colour are inherited from #rightSendForm so the icon
+       matches #send_but exactly. */
+    cursor: pointer;
+    align-self: center;
+    transition: color 0.15s;
+}
+
+#swipe_pregen_send_queue_btn:hover {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, var(--SmartThemeBodyColor));
+}
+
+/*
+ * Follow #send_but's own visibility: SillyTavern hides it while generating or
+ * swiping, and carries .displayNone on it while no API is connected.
+ */
+body:is([data-generating="true"], [data-swiping="true"]) #swipe_pregen_send_queue_btn,
+#rightSendForm:has(> #send_but.displayNone) #swipe_pregen_send_queue_btn {
+    display: none;
+}
+
+/* ── Settings panel ──────────────────────────────────────────────────────── */
+
+#swipe_pregen_settings .inline-drawer-content > label {
+    margin-bottom: 6px;
+}
+
+#swipe_pregen_settings .sp_settings_hint {
+    display: block;
+    opacity: 0.65;
+}

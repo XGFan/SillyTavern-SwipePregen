@@ -11,5 +11,10 @@
     "Number of swipes to pre-generate:": "\u9884\u751f\u6210\u56de\u590d\u6570\u91cf\uff1a",
     "Show progress bar": "\u663e\u793a\u8fdb\u5ea6\u6761",
     "Start": "\u5f00\u59cb",
-    "Cancel": "\u53d6\u6d88"
+    "Cancel": "\u53d6\u6d88",
+    "Send and pre-generate extra swipes": "\u53d1\u9001\u5e76\u9884\u751f\u6210\u989d\u5916\u56de\u590d",
+    "Delay between requests (ms)": "\u8bf7\u6c42\u95f4\u9694\uff08\u6beb\u79d2\uff09",
+    "Replies per send": "\u6bcf\u6b21\u53d1\u9001\u751f\u6210\u7684\u56de\u590d\u6570",
+    "The normal send button queues replies too": "\u666e\u901a\u53d1\u9001\u6309\u94ae\u4e5f\u6392\u961f\u751f\u6210\u56de\u590d",
+    "The delay is applied between every two queued generations.": "\u8be5\u95f4\u9694\u5e94\u7528\u4e8e\u6bcf\u4e24\u6b21\u6392\u961f\u751f\u6210\u4e4b\u95f4\u3002"
 }

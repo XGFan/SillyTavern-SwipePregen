@@ -8,6 +8,13 @@
  *
  * Feature 2: "Swipe pre-generation" entry in the Extensions wand menu.
  *   Opens a modal to batch-pre-generate N swipes with an optional progress bar.
+ *
+ * Feature 3: "Send and queue" button next to SillyTavern's send button.
+ *   Sends the typed message and pre-generates extra swipes on top of the reply.
+ *   The plain send button can be made to do the same from the settings panel.
+ *
+ * Feature 4: Settings panel in the Extensions drawer, most importantly the
+ *   delay inserted between two queued generations.
  */
 
 import {
@@ -29,17 +36,39 @@ import { t } from '../../../i18n.js';
 
 const MODULE_NAME   = 'swipe_pregen';
 const PROGRESS_ID   = `${MODULE_NAME}_progress_bar`;
+const SEND_BTN_ID   = `${MODULE_NAME}_send_queue_btn`;
+const SETTINGS_ID   = `${MODULE_NAME}_settings`;
 const BTN_CLASS     = 'sp_bg_gen_btn';
+
+/** How long to wait for a send to actually raise SillyTavern's generating flag. */
+const GEN_START_TIMEOUT_MS = 10 * 1000;
+/** Upper bound on how long to wait for the reply itself to finish. */
+const GEN_END_TIMEOUT_MS   = 15 * 60 * 1000;
 
 const DEFAULT_SETTINGS = {
     defaultBatchSize : 3,
     showProgressBar  : true,
+    /** Pause between two queued generations, in milliseconds. */
+    requestDelayMs   : 300,
+    /** Total replies the send-and-queue button aims for (1 = a plain send). */
+    sendBatchSize    : 3,
+    /** Let SillyTavern's own send button queue swipes as well. */
+    queueOnNormalSend: false,
 };
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let isBackgroundGenerating = false;  // single-gen lock
 let batchAbort             = false;  // batch abort flag
+
+/** Extra swipes armed by the send-and-queue button, consumed by GENERATION_STARTED. */
+let armedExtraSwipes = 0;
+
+/** True while a queue run is waiting for the reply it is going to extend. */
+let queueWaiting = false;
+
+/** Set when the user aborts or switches chat while a queue run is waiting. */
+let queueCancelled = false;
 
 /** Direct reference to the frozen real .mes element, for height-lock cleanup. */
 let $frozenMes = null;
@@ -56,10 +85,51 @@ function getSettings() {
     if (!extension_settings[MODULE_NAME]) {
         extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS };
     }
-    return extension_settings[MODULE_NAME];
+
+    // Backfill keys introduced by later versions into an existing settings object.
+    const settings = extension_settings[MODULE_NAME];
+    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+        if (settings[key] === undefined) settings[key] = value;
+    }
+
+    return settings;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Parse a user-supplied number, clamped into range.
+ * @returns {number} `fallback` when the input is not a number.
+ */
+function clampInt(value, min, max, fallback) {
+    const n = parseInt(value, 10);
+    return isNaN(n) ? fallback : Math.min(Math.max(n, min), max);
+}
+
+/**
+ * Poll `predicate` every 100 ms until it is true or `timeoutMs` has elapsed.
+ * @returns {Promise<boolean>} the last value of the predicate.
+ */
+async function waitUntil(predicate, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (predicate()) return true;
+        await sleep(100);
+    }
+    return predicate();
+}
+
+/**
+ * Retry `inject` until it reports success – several of the hosts we attach to
+ * are built lazily by SillyTavern and are not in the DOM when we load.
+ * @param {() => boolean} inject  Returns true once the injection succeeded.
+ */
+function pollUntilReady(inject, attempts = 20, intervalMs = 250) {
+    if (inject() || attempts <= 0) return;
+    setTimeout(() => pollUntilReady(inject, attempts - 1, intervalMs), intervalMs);
+}
 
 /** Returns true when it is safe to start a background generation. */
 function canStart() {
@@ -306,7 +376,7 @@ async function runBatch(count) {
 
         // Brief pause to avoid hammering the API
         if (i < count - 1 && !batchAbort) {
-            await new Promise(r => setTimeout(r, 300));
+            await sleep(settings.requestDelayMs);
         }
     }
 
@@ -314,6 +384,62 @@ async function runBatch(count) {
 
     if (completed > 0) {
         toastr.success(t`Pre-generation complete! Generated ${completed} swipe(s).`);
+    }
+}
+
+// ─── Core: send and queue ────────────────────────────────────────────────────
+
+/**
+ * Wait for the generation that just started to land, then pre-generate `extra`
+ * more swipes on top of the reply it produced.
+ *
+ * @param {number} extra  Number of additional swipes to queue.
+ */
+async function queueAfterCurrentGeneration(extra) {
+    if (queueWaiting) return;
+    queueWaiting   = true;
+    queueCancelled = false;
+
+    const chatId = getContext()?.chatId;
+
+    try {
+        // GENERATION_STARTED is emitted before SillyTavern raises its generating
+        // flag, so wait for the flag to go up before waiting for it to drop.
+        await waitUntil(() => queueCancelled || isGenerating(), GEN_START_TIMEOUT_MS);
+        await waitUntil(() => queueCancelled || !isGenerating(), GEN_END_TIMEOUT_MS);
+        if (queueCancelled) return;
+
+        // Give SillyTavern a moment to render and save the fresh reply.
+        await sleep(getSettings().requestDelayMs);
+        if (queueCancelled || getContext()?.chatId !== chatId || !canStart()) return;
+
+        await runBatch(extra);
+    } finally {
+        queueWaiting = false;
+    }
+}
+
+/**
+ * Send the typed message through SillyTavern's own send button, then queue the
+ * remaining swipes on top of the reply.
+ *
+ * Clicking the real button keeps the whole send path intact (slash commands,
+ * attachments, continue-on-send, group chats), so all we do is arm the counter
+ * and let the GENERATION_STARTED handler pick it up.
+ */
+async function sendAndQueue() {
+    if (isBackgroundGenerating || isGenerating()) {
+        toastr.warning(t`A generation is already in progress.`);
+        return;
+    }
+
+    armedExtraSwipes = Math.max(0, getSettings().sendBatchSize - 1);
+    $('#send_but').trigger('click');
+
+    // If the send was refused (no API connected, mid-swipe, …) nothing will ever
+    // consume the arm, so drop it again.
+    if (!await waitUntil(() => isGenerating(), GEN_START_TIMEOUT_MS)) {
+        armedExtraSwipes = 0;
     }
 }
 
@@ -400,10 +526,113 @@ function refreshBgGenButton() {
     }
 }
 
+// ─── Send-area button ─────────────────────────────────────────────────────────
+
+/**
+ * Inject the send-and-queue button next to SillyTavern's send button.
+ * @returns {boolean} true once the button is in place.
+ */
+function addSendQueueButton() {
+    if ($(`#${SEND_BTN_ID}`).length) return true;
+
+    const $sendBut = $('#send_but');
+    if (!$sendBut.length) return false;
+
+    const $btn = $(`<div id="${SEND_BTN_ID}" class="fa-solid fa-layer-group interactable" tabindex="0" title="${t`Send and pre-generate extra swipes`}"></div>`);
+
+    $btn.on('click', async (e) => {
+        e.stopPropagation();
+        await sendAndQueue();
+    });
+
+    // Left of the send button, so the send button keeps its usual position.
+    $sendBut.before($btn);
+    return true;
+}
+
+// ─── Settings panel ───────────────────────────────────────────────────────────
+
+/**
+ * Inject the settings drawer into the Extensions settings column.
+ * @returns {boolean} true once the panel is in place.
+ */
+function addSettingsPanel() {
+    if ($(`#${SETTINGS_ID}`).length) return true;
+
+    const $host = $('#extensions_settings2');
+    if (!$host.length) return false;
+
+    const settings = getSettings();
+
+    const $panel = $(`
+        <div id="${SETTINGS_ID}" class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>${t`Swipe Pre-generation`}</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <label class="flex-container alignItemsCenter justifySpaceBetween">
+                    <span>${t`Delay between requests (ms)`}</span>
+                    <input id="sp_opt_delay" type="number" min="0" max="60000" step="100" class="text_pole" style="width:90px;">
+                </label>
+                <label class="flex-container alignItemsCenter justifySpaceBetween">
+                    <span>${t`Replies per send`}</span>
+                    <input id="sp_opt_send_size" type="number" min="1" max="20" class="text_pole" style="width:90px;">
+                </label>
+                <label class="checkbox_label">
+                    <input id="sp_opt_queue_on_send" type="checkbox">
+                    <span>${t`The normal send button queues replies too`}</span>
+                </label>
+                <label class="checkbox_label">
+                    <input id="sp_opt_progress" type="checkbox">
+                    <span>${t`Show progress bar`}</span>
+                </label>
+                <small class="sp_settings_hint">${t`The delay is applied between every two queued generations.`}</small>
+            </div>
+        </div>
+    `);
+
+    const $delay    = $panel.find('#sp_opt_delay').val(settings.requestDelayMs);
+    const $sendSize = $panel.find('#sp_opt_send_size').val(settings.sendBatchSize);
+
+    // Clamp on change rather than on input so typing is not fought mid-keystroke.
+    $delay.on('change', function () {
+        settings.requestDelayMs = clampInt($(this).val(), 0, 60000, DEFAULT_SETTINGS.requestDelayMs);
+        $(this).val(settings.requestDelayMs);
+        saveSettingsDebounced();
+    });
+
+    $sendSize.on('change', function () {
+        settings.sendBatchSize = clampInt($(this).val(), 1, 20, DEFAULT_SETTINGS.sendBatchSize);
+        $(this).val(settings.sendBatchSize);
+        saveSettingsDebounced();
+    });
+
+    $panel.find('#sp_opt_queue_on_send').prop('checked', settings.queueOnNormalSend).on('change', function () {
+        settings.queueOnNormalSend = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $panel.find('#sp_opt_progress').prop('checked', settings.showProgressBar).on('change', function () {
+        settings.showProgressBar = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $host.append($panel);
+    return true;
+}
+
 // ─── Extensions-menu entry ────────────────────────────────────────────────────
 
+/**
+ * Inject the wand-menu entry that opens the batch modal.
+ * @returns {boolean} true once the entry is in place.
+ */
 function addExtensionsMenuEntry() {
-    if ($('#sp_wand_entry').length) return;  // guard against double-injection
+    if ($('#sp_wand_entry').length) return true;  // guard against double-injection
+
+    const $menu = $('#extensionsMenu');
+    if (!$menu.length) return false;
 
     const $entry = $(`
         <div id="sp_wand_entry" class="extension_container">
@@ -423,7 +652,8 @@ function addExtensionsMenuEntry() {
         await openPregenModal();
     });
 
-    $('#extensionsMenu').append($entry);
+    $menu.append($entry);
+    return true;
 }
 
 // ─── Pre-generation modal ─────────────────────────────────────────────────────
@@ -468,8 +698,7 @@ async function openPregenModal() {
     if (result === POPUP_RESULT.AFFIRMATIVE) {
         // Read values from our own cached jQuery reference – safe even if the
         // popup has already detached the nodes from the document.
-        const countRaw            = parseInt($content.find('#sp_batch_size').val(), 10);
-        const count               = isNaN(countRaw) || countRaw < 1 ? settings.defaultBatchSize : Math.min(countRaw, 20);
+        const count               = clampInt($content.find('#sp_batch_size').val(), 1, 20, settings.defaultBatchSize);
         settings.showProgressBar  = $content.find('#sp_show_progress').prop('checked');
         settings.defaultBatchSize = count;
         saveSettingsDebounced();
@@ -495,24 +724,39 @@ async function openPregenModal() {
     eventSource.on(event_types.MESSAGE_DELETED,            () => refreshBgGenButton());
     eventSource.on(event_types.CHAT_LOADED,                () => refreshBgGenButton());
 
+    // A plain user send is the cue to queue extra swipes on top of the reply.
+    eventSource.on(event_types.GENERATION_STARTED, (type, _options, dryRun) => {
+        if (dryRun || isBackgroundGenerating) return;
+        if (type && type !== 'normal') return;  // swipe / continue / impersonate / quiet
+
+        const settings   = getSettings();
+        const armed      = armedExtraSwipes;
+        armedExtraSwipes = 0;
+
+        const extra = armed || (settings.queueOnNormalSend ? settings.sendBatchSize - 1 : 0);
+        if (extra > 0) queueAfterCurrentGeneration(extra);
+    });
+
+    // Aborting the reply also cancels whatever was queued behind it.
+    eventSource.on(event_types.GENERATION_STOPPED, () => {
+        armedExtraSwipes = 0;
+        queueCancelled   = true;
+    });
+
     // Clean up on chat switch
     eventSource.on(event_types.CHAT_CHANGED, () => {
-        batchAbort = true;
+        batchAbort       = true;
+        armedExtraSwipes = 0;
+        queueCancelled   = true;
         removeOverlay();
         removeProgressBar();
         isBackgroundGenerating = false;
     });
 
-    // The Extensions-menu is appended to <body> lazily; poll briefly then add entry
-    let _menuAttempts = 0;
-    const tryAddMenuEntry = () => {
-        if ($('#extensionsMenu').length) {
-            addExtensionsMenuEntry();
-        } else if (_menuAttempts++ < 20) {
-            setTimeout(tryAddMenuEntry, 250);
-        }
-    };
-    tryAddMenuEntry();
+    // Several of these hosts are built lazily by SillyTavern, so poll for each.
+    pollUntilReady(addExtensionsMenuEntry);
+    pollUntilReady(addSendQueueButton);
+    pollUntilReady(addSettingsPanel);
 
     // In case a chat is already loaded when this extension loads
     setTimeout(refreshBgGenButton, 500);
