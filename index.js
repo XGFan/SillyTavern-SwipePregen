@@ -82,8 +82,13 @@ let queueCancelled = false;
 
 /**
  * Live 遮挡层 state, or null when nothing is masked.
+ *
+ * `snapshotSwipeId` is the 备选回复 the clone was taken on and `bodyIsSnapshot`
+ * whether it still holds that untouched copy of it - see `renderMask`.
+ *
  * @type {{ real: HTMLElement, clone: HTMLElement, message: object, mesId: number,
  *          completedCount: number, viewedSwipeId: number,
+ *          snapshotSwipeId: number, bodyIsSnapshot: boolean,
  *          handlers: { $el: JQuery, fn: Function }[] } | null}
  */
 let mask = null;
@@ -201,7 +206,14 @@ function applyMask({ mesId, message, completedCount, viewedSwipeId }) {
     real.classList.add('sp_mask_hidden');
     real.after(clone);
 
-    mask = { real, clone, message, mesId, completedCount, viewedSwipeId, handlers: [] };
+    mask = {
+        real, clone, message, mesId, completedCount, viewedSwipeId,
+        // What the clone actually shows, which is whatever the real element was
+        // displaying - not the 备选回复 the caller asks the mask to land on.
+        snapshotSwipeId: message.swipe_id ?? 0,
+        bodyIsSnapshot : true,
+        handlers       : [],
+    };
 
     // Bound through jQuery, not addEventListener. SillyTavern's own chevron
     // handler is delegated on `document`, and its keyboard shortcut, touch
@@ -243,12 +255,53 @@ function restoreLastMes() {
 function renderMask() {
     if (!mask) return;
 
-    const { clone, message, mesId, completedCount } = mask;
-    const ctx = getContext();
+    const { clone, completedCount } = mask;
 
     // Clamped here as well as in navigateMask: "4/3" was born of an out-of-range
     // swipe_id reaching a formatter, so the formatter itself refuses to print one.
     const id = Math.min(Math.max(mask.viewedSwipeId, 0), Math.max(0, completedCount - 1));
+
+    // The clone is a copy of the finished message, so on the 备选回复 it was taken
+    // from it already holds the real thing - including whatever a third-party
+    // renderer built in there. Those renderers key on `mesid` and only re-scan a
+    // message when SillyTavern names it in an event (酒馆助手 swaps an HTML
+    // template's code block for an iframe that way), so none of them can rebuild
+    // anything inside a mesid-less clone: re-filling this body from swipes[]
+    // would drop the reader back to the bare source of their own template for the
+    // whole run. Fill it only where the snapshot cannot answer, and from then on
+    // always, because the snapshot is gone the first time it is overwritten.
+    if (id !== mask.snapshotSwipeId || !mask.bodyIsSnapshot) {
+        fillMaskBody(id);
+        mask.bodyIsSnapshot = false;
+    }
+
+    // The slot being written is not a 备选回复, so it is neither counted nor reachable.
+    const counter = clone.querySelector('.swipes-counter');
+    if (counter) {
+        // SillyTavern marks the counter hidden for the duration of a generation;
+        // inside the 遮挡层 it is the reader's only position indicator.
+        counter.removeAttribute('hidden');
+        counter.textContent = `${id + 1}\u200b/\u200b${completedCount}`;
+    }
+
+    // The clone is a snapshot, so it never gains the classes SillyTavern adds to
+    // the real message as the 排队 banks more 备选回复. `swipes_visible` is the one
+    // that matters: without it the theme treats this message as having nothing to
+    // swipe between and hides the chevrons and the counter.
+    clone.classList.toggle('swipes_visible', completedCount > 1);
+
+    clone.classList.toggle('sp_mask_at_start', id <= 0);
+    clone.classList.toggle('sp_mask_at_end', id >= completedCount - 1);
+}
+
+/**
+ * Write one 备选回复 into the 遮挡层's body: text, thinking, timer, token count.
+ *
+ * Only reached for a 备选回复 the clone's own snapshot cannot show - see renderMask.
+ */
+function fillMaskBody(id) {
+    const { clone, message, mesId } = mask;
+    const ctx = getContext();
     const info = message.swipe_info?.[id] ?? {};
 
     // Only message 0 is passed as -1. SillyTavern's formatter writes macro
@@ -301,24 +354,6 @@ function renderMask() {
         const count = info.extra?.token_count;
         tokens.textContent = count ? `${count}t` : '';
     }
-
-    // The slot being written is not a 备选回复, so it is neither counted nor reachable.
-    const counter = clone.querySelector('.swipes-counter');
-    if (counter) {
-        // SillyTavern marks the counter hidden for the duration of a generation;
-        // inside the 遮挡层 it is the reader's only position indicator.
-        counter.removeAttribute('hidden');
-        counter.textContent = `${id + 1}\u200b/\u200b${completedCount}`;
-    }
-
-    // The clone is a snapshot, so it never gains the classes SillyTavern adds to
-    // the real message as the 排队 banks more 备选回复. `swipes_visible` is the one
-    // that matters: without it the theme treats this message as having nothing to
-    // swipe between and hides the chevrons and the counter.
-    clone.classList.toggle('swipes_visible', completedCount > 1);
-
-    clone.classList.toggle('sp_mask_at_start', id <= 0);
-    clone.classList.toggle('sp_mask_at_end', id >= completedCount - 1);
 }
 
 /** Move the reader between finished 备选回复 while a generation is running. */
@@ -397,12 +432,20 @@ function restoreState(msg, state, swipeId = state.swipeId) {
 /**
  * Re-render a message after its viewed 备选回复 changed.
  *
+ * MESSAGE_SWIPED is what SillyTavern emits after its own swipe re-render, and
+ * third-party renderers are listening for it: 酒馆助手 keeps one iframe per
+ * `mesid` and re-scans a message only when an event names it, so without the
+ * emit the HTML template `addOneMessage` just rebuilt stays the bare source of
+ * a code block. Every core listener already handles this event on every
+ * ordinary swipe, which is exactly what this is.
+ *
  * `refreshBgGenButton` has to come last: SillyTavern's re-render rebuilds the
  * swipe area, taking this extension's button with it.
  */
-function rerenderMessage(msg, mesId) {
+async function rerenderMessage(msg, mesId) {
     addOneMessage(msg, { type: 'swipe', forceId: mesId, showSwipes: true });
     refreshSwipeButtons(true);
+    await getContext().eventSource.emit(event_types.MESSAGE_SWIPED, mesId);
     refreshBgGenButton();
 }
 
@@ -528,7 +571,7 @@ async function runBackgroundGeneration({ silent = false } = {}) {
                 renderMask();
             }
 
-            rerenderMessage(updatedMsg, lastIdx);
+            await rerenderMessage(updatedMsg, lastIdx);
             await saveChatConditional();
             if (!silent) toastr.success(t`Swipe ready! (${newCount} total)`, '', { timeOut: 2500 });
             return true;
@@ -606,7 +649,7 @@ async function runBatch(count) {
         if (typeof viewed === 'number' && current && current.swipe_id !== viewed
             && current.swipes?.[viewed] !== undefined) {
             restoreState(current, captureState(current, viewed), viewed);
-            rerenderMessage(current, mesId);
+            await rerenderMessage(current, mesId);
         }
 
         refreshBgGenButton();
