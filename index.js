@@ -93,6 +93,9 @@ let queueCancelled = false;
  */
 let mask = null;
 
+/** The #chat element whose scroll position the 遮挡层 currently pins, or null. */
+let scrollLockTarget = null;
+
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
 function getSettings() {
@@ -235,6 +238,7 @@ function applyMask({ mesId, message, completedCount, viewedSwipeId }) {
         mask.handlers.push({ $el, fn });
     }
 
+    lockChatScroll();
     renderMask();
     return true;
 }
@@ -367,8 +371,47 @@ function navigateMask(step) {
     renderMask();
 }
 
+/**
+ * Pin the chat's scroll position for as long as the 遮挡层 is up.
+ *
+ * SillyTavern scrolls the chat to the bottom of the message it is writing into
+ * (`expandNewMessage`'s `getMessageBottomHeight`, script.js:10256 and 10261),
+ * and under a 遮挡层 that message is the one taken out of the flow, with its
+ * `.mes_text` already emptied to "...". The geometry it measures is the
+ * collapsed stand-in rather than what the reader is looking at, so the chat
+ * jumps up by roughly the height of the reply on screen and stays there for the
+ * whole generation. `addOneMessage`'s own `scrollChatToBottom` is the same story
+ * pointing the other way, for a reader who scrolled up mid-排队.
+ *
+ * Only programmatic writes go through the property; wheel, touch, scrollbar and
+ * keyboard scrolling never touch it, so the reader keeps the view.
+ */
+function lockChatScroll() {
+    if (scrollLockTarget) return;
+
+    const chat   = document.getElementById('chat');
+    const native = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+    if (!chat || !native) return;
+
+    Object.defineProperty(chat, 'scrollTop', {
+        configurable: true,
+        get() { return native.get.call(this); },
+        set() { /* the 遮挡层 owns the view until it comes down */ },
+    });
+    scrollLockTarget = chat;
+}
+
+/** Hand the chat's scroll position back to SillyTavern. */
+function unlockChatScroll() {
+    if (!scrollLockTarget) return;
+
+    delete scrollLockTarget.scrollTop;
+    scrollLockTarget = null;
+}
+
 /** Drop the 遮挡层 and let the real message show again. */
 function removeMask() {
+    unlockChatScroll();
     if (!mask) return;
 
     for (const { $el, fn } of mask.handlers) {
